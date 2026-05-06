@@ -21,9 +21,9 @@ app.get('/pedidos', async (req, res) => {
     let query = 'SELECT * FROM pedidos_estruturados WHERE 1=1';
     const params = [];
     if (status && status !== 'todos') { params.push(status); query += ` AND status = $${params.length}`; }
-    if (data_inicio) { params.push(data_inicio); query += ` AND updated_at >= $${params.length}`; }
-    if (data_fim) { params.push(data_fim + ' 23:59:59'); query += ` AND updated_at <= $${params.length}`; }
-    query += ' ORDER BY updated_at DESC';
+    if (data_inicio) { params.push(data_inicio); query += ` AND created_at >= $${params.length}`; }
+    if (data_fim) { params.push(data_fim + ' 23:59:59'); query += ` AND created_at <= $${params.length}`; }
+    query += ' ORDER BY COALESCE(ordem, 99999) ASC, created_at ASC';
     const result = await pool.query(query, params);
     res.json(result.rows);
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -38,8 +38,8 @@ app.post('/pedidos', async (req, res) => {
         chatid, nome_cliente, instagram, whatsapp_cartao, categoria,
         produto, quantidade, corte, cep, valor_produto, valor_frete,
         sinal_pago, arte_enviada, arte_aprovada, pagamento_final,
-        postado, link_rastreio, pasta_drive, status, updated_at
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,NOW())
+        postado, link_rastreio, pasta_drive, status, created_at, updated_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,NOW(),NOW())
       ON CONFLICT (chatid) DO UPDATE SET
         nome_cliente=EXCLUDED.nome_cliente, instagram=EXCLUDED.instagram,
         whatsapp_cartao=EXCLUDED.whatsapp_cartao, categoria=EXCLUDED.categoria,
@@ -70,7 +70,7 @@ app.patch('/pedidos/:chatid', async (req, res) => {
       'nome_cliente','instagram','whatsapp_cartao','categoria','produto',
       'quantidade','corte','cep','valor_produto','valor_frete','sinal_pago',
       'data_sinal','arte_enviada','arte_aprovada','pagamento_final','postado',
-      'link_rastreio','pasta_drive','status'
+      'link_rastreio','pasta_drive','status','ordem'
     ];
     let updates = {};
     if (req.body.campo && permitidos.includes(req.body.campo)) {
