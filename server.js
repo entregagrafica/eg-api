@@ -333,5 +333,207 @@ app.get('/metricas', async (req, res) => {
   }
 });
 
+app.get('/clientes', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        c.id,
+        c.instance_name,
+        c.chatid,
+        c.nome_cliente,
+        c.instagram,
+        c.whatsapp_cartao,
+        c.cep,
+        c.origem,
+        c.observacoes,
+        c.created_at,
+        c.updated_at,
+        COUNT(p.id)::INTEGER AS total_pedidos,
+        COALESCE(SUM(COALESCE(p.valor_produto, 0) + COALESCE(p.valor_frete, 0)), 0)::DECIMAL(10,2) AS valor_total,
+        MAX(p.updated_at) AS ultimo_pedido_at
+      FROM crm_clientes c
+      LEFT JOIN crm_pedidos p ON p.cliente_id = c.id
+      GROUP BY c.id
+      ORDER BY COALESCE(MAX(p.updated_at), c.updated_at) DESC NULLS LAST
+      LIMIT 500
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/clientes/:id', async (req, res) => {
+  try {
+    const cliente = await pool.query('SELECT * FROM crm_clientes WHERE id=$1', [req.params.id]);
+    if (!cliente.rows.length) return res.status(404).json({ error: 'Cliente nao encontrado' });
+
+    const pedidos = await pool.query(`
+      SELECT *
+      FROM dashboard_pedidos_compat
+      WHERE pedido_id IN (SELECT id FROM crm_pedidos WHERE cliente_id=$1)
+      ORDER BY updated_at DESC NULLS LAST
+    `, [req.params.id]);
+
+    const eventos = await pool.query(`
+      SELECT e.*
+      FROM crm_pedido_eventos e
+      WHERE e.cliente_id=$1
+      ORDER BY e.created_at DESC
+      LIMIT 100
+    `, [req.params.id]);
+
+    res.json({
+      cliente: cliente.rows[0],
+      pedidos: pedidos.rows,
+      eventos: eventos.rows
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/leads', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        l.*,
+        c.nome_cliente,
+        c.chatid,
+        c.instagram,
+        c.whatsapp_cartao
+      FROM crm_leads l
+      JOIN crm_clientes c ON c.id = l.cliente_id
+      ORDER BY COALESCE(l.proximo_followup, l.updated_at) DESC NULLS LAST
+      LIMIT 500
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/atencao', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      WITH itens AS (
+        SELECT
+          'arte_atrasada' AS tipo,
+          'Arte pendente ha mais de 72h uteis ou pedido antigo sem arte' AS motivo,
+          p.id AS pedido_id,
+          p.codigo,
+          p.chatid,
+          c.nome_cliente,
+          p.status,
+          p.valor_produto,
+          p.valor_frete,
+          p.sinal_pago,
+          p.data_sinal,
+          p.arte_enviada,
+          p.arte_aprovada,
+          p.pagamento_final,
+          p.postado,
+          p.updated_at,
+          p.created_at
+        FROM crm_pedidos p
+        JOIN crm_clientes c ON c.id = p.cliente_id
+        WHERE p.sinal_pago = true
+          AND p.arte_enviada = false
+          AND COALESCE(p.status, '') NOT IN ('finalizado', 'postado', 'cancelado', 'arquivado')
+          AND COALESCE(p.data_sinal, p.created_at) < NOW() - INTERVAL '3 days'
+
+        UNION ALL
+
+        SELECT
+          'sem_dados' AS tipo,
+          'Pedido com dados importantes faltando' AS motivo,
+          p.id AS pedido_id,
+          p.codigo,
+          p.chatid,
+          c.nome_cliente,
+          p.status,
+          p.valor_produto,
+          p.valor_frete,
+          p.sinal_pago,
+          p.data_sinal,
+          p.arte_enviada,
+          p.arte_aprovada,
+          p.pagamento_final,
+          p.postado,
+          p.updated_at,
+          p.created_at
+        FROM crm_pedidos p
+        JOIN crm_clientes c ON c.id = p.cliente_id
+        WHERE COALESCE(p.status, '') NOT IN ('finalizado', 'postado', 'cancelado', 'arquivado')
+          AND (p.produto IS NULL OR p.quantidade IS NULL OR p.cep IS NULL)
+
+        UNION ALL
+
+        SELECT
+          'falha_automacao' AS tipo,
+          COALESCE(f.erro, 'Falha de automacao aberta') AS motivo,
+          f.pedido_id,
+          p.codigo,
+          COALESCE(f.chatid, p.chatid) AS chatid,
+          c.nome_cliente,
+          p.status,
+          p.valor_produto,
+          p.valor_frete,
+          p.sinal_pago,
+          p.data_sinal,
+          p.arte_enviada,
+          p.arte_aprovada,
+          p.pagamento_final,
+          p.postado,
+          f.created_at AS updated_at,
+          f.created_at
+        FROM crm_automacao_falhas f
+        LEFT JOIN crm_pedidos p ON p.id = f.pedido_id
+        LEFT JOIN crm_clientes c ON c.id = p.cliente_id
+        WHERE f.resolvido = false
+      )
+      SELECT *
+      FROM itens
+      ORDER BY updated_at DESC NULLS LAST
+      LIMIT 300
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/eventos', async (req, res) => {
+  try {
+    const { pedido_id, cliente_id } = req.query;
+    const params = [];
+    let where = 'WHERE 1=1';
+    if (pedido_id) {
+      params.push(pedido_id);
+      where += ` AND e.pedido_id = $${params.length}`;
+    }
+    if (cliente_id) {
+      params.push(cliente_id);
+      where += ` AND e.cliente_id = $${params.length}`;
+    }
+    const result = await pool.query(`
+      SELECT
+        e.*,
+        p.codigo,
+        c.nome_cliente,
+        c.chatid
+      FROM crm_pedido_eventos e
+      LEFT JOIN crm_pedidos p ON p.id = e.pedido_id
+      LEFT JOIN crm_clientes c ON c.id = e.cliente_id
+      ${where}
+      ORDER BY e.created_at DESC
+      LIMIT 300
+    `, params);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => console.log(`API rodando na porta ${PORT}`));
