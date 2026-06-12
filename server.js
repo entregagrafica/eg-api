@@ -211,7 +211,7 @@ app.get('/pedidos', async (req, res) => {
       query += ` AND created_at::date <= $${params.length}::date`;
     }
 
-    query += ' ORDER BY CASE WHEN ordem IS NULL THEN 1 ELSE 0 END, ordem ASC, COALESCE(data_sinal, updated_at, created_at) DESC';
+    query += ' ORDER BY CASE WHEN ordem IS NULL THEN 1 ELSE 0 END, ordem ASC, COALESCE(data_sinal, created_at) DESC';
     const result = await pool.query(query, params);
     res.json(result.rows);
   } catch (err) {
