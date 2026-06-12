@@ -16,6 +16,14 @@ const pool = new Pool({
 });
 
 const DEFAULT_INSTANCE = process.env.DEFAULT_INSTANCE_NAME || 'atendimento-zap';
+const badClientNames = new Set([
+  'entrega grafica',
+  'entrega gr?fica',
+  'sem nome',
+  'desconhecido',
+  'unknown',
+  'null'
+]);
 
 const clienteFields = new Set([
   'nome_cliente',
@@ -56,6 +64,12 @@ function cleanText(value) {
   if (value === undefined || value === null) return null;
   const text = String(value).trim();
   return text === '' ? null : text;
+}
+
+function cleanClientName(value) {
+  const text = cleanText(value);
+  if (!text) return null;
+  return badClientNames.has(text.toLowerCase()) ? null : text;
 }
 
 function normalizeValue(field, value) {
@@ -127,7 +141,7 @@ async function upsertCliente(client, body) {
   `, [
     instanceName,
     chatid,
-    cleanText(body.nome_cliente),
+    cleanClientName(body.nome_cliente),
     cleanText(body.instagram),
     cleanText(body.whatsapp_cartao),
     cleanText(body.cep)
@@ -196,7 +210,7 @@ app.get('/pedidos', async (req, res) => {
       query += ` AND created_at::date <= $${params.length}::date`;
     }
 
-    query += ' ORDER BY CASE WHEN ordem IS NULL THEN 1 ELSE 0 END, ordem ASC, created_at ASC';
+    query += ' ORDER BY CASE WHEN ordem IS NULL THEN 1 ELSE 0 END, ordem ASC, COALESCE(data_sinal, updated_at, created_at) DESC';
     const result = await pool.query(query, params);
     res.json(result.rows);
   } catch (err) {
@@ -249,7 +263,7 @@ app.patch('/pedidos/:id', async (req, res) => {
 
     const clienteUpdates = Object.keys(updates).filter((key) => clienteFields.has(key));
     if (clienteUpdates.length) {
-      const values = clienteUpdates.map((key) => normalizeValue(key, updates[key]));
+      const values = clienteUpdates.map((key) => key === 'nome_cliente' ? cleanClientName(updates[key]) : normalizeValue(key, updates[key]));
       values.push(pedido.cliente_id);
       const set = clienteUpdates.map((key, index) => `${key}=$${index + 1}`).join(', ');
       await client.query(
