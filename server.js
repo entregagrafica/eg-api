@@ -193,8 +193,9 @@ async function criarPedido(client, cliente, body) {
 
 app.get('/pedidos', async (req, res) => {
   try {
-    const { status, data_inicio, data_fim } = req.query;
+    const { status, data_inicio, data_fim, incluir_sem_sinal } = req.query;
     let query = "SELECT * FROM dashboard_pedidos_compat WHERE COALESCE(status, '') <> 'arquivado'";
+    if (incluir_sem_sinal !== 'true') query += ' AND sinal_pago = true';
     const params = [];
 
     if (status && status !== 'todos') {
@@ -340,6 +341,7 @@ app.get('/metricas', async (req, res) => {
         COALESCE(SUM(COALESCE(valor_produto, 0) + COALESCE(valor_frete, 0)), 0)::DECIMAL(10,2) AS receita_total
       FROM dashboard_pedidos_compat
       WHERE COALESCE(status, '') <> 'arquivado'
+        AND sinal_pago = true
     `);
     res.json(result.rows[0]);
   } catch (err) {
