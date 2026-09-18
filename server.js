@@ -3,8 +3,30 @@ const { Pool } = require('pg');
 const cors = require('cors');
 
 const app = express();
-app.use(cors());
+const allowedOrigins = (process.env.DASHBOARD_ALLOWED_ORIGINS || '')
+  .split(',')
+  .map((value) => value.trim())
+  .filter(Boolean);
+
+app.use(cors({
+  origin(origin, callback) {
+    // Requests made locally by a health check have no Origin header.
+    if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error('Origem nao autorizada'));
+  }
+}));
 app.use(express.json());
+
+// When DASHBOARD_API_TOKEN is configured, every dashboard request must carry it.
+// Keeping this optional preserves a safe migration path for the current dashboard;
+// it must be configured before exposing this API on a public domain.
+app.use((req, res, next) => {
+  const expected = process.env.DASHBOARD_API_TOKEN;
+  if (!expected) return next();
+  const authorization = req.get('authorization') || '';
+  if (authorization === `Bearer ${expected}`) return next();
+  return res.status(401).json({ error: 'Nao autorizado' });
+});
 
 const pool = new Pool({
   host: process.env.DB_HOST,
@@ -40,11 +62,8 @@ const pedidoFields = new Set([
   'cep',
   'valor_produto',
   'valor_frete',
-  'sinal_pago',
-  'data_sinal',
   'arte_enviada',
   'arte_aprovada',
-  'pagamento_final',
   'postado',
   'link_rastreio',
   'pasta_drive',
@@ -53,10 +72,8 @@ const pedidoFields = new Set([
 ]);
 
 const booleanFields = new Set([
-  'sinal_pago',
   'arte_enviada',
   'arte_aprovada',
-  'pagamento_final',
   'postado'
 ]);
 
@@ -281,13 +298,6 @@ app.patch('/pedidos/:id', async (req, res) => {
       await client.query(
         `UPDATE crm_pedidos SET ${set}, updated_at=NOW() WHERE id=$${values.length}`,
         values
-      );
-    }
-
-    if (updates.sinal_pago === true || updates.sinal_pago === 'true' || updates.sinal_pago === 'sim') {
-      await client.query(
-        'UPDATE crm_pedidos SET data_sinal=COALESCE(data_sinal, NOW()) WHERE id=$1',
-        [pedido.id]
       );
     }
 
@@ -548,6 +558,74 @@ app.get('/eventos', async (req, res) => {
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// Conversation data is read directly from the message ledger. It deliberately
+// uses instance_name + chatid: a WhatsApp chat id alone is not globally unique.
+app.get('/conversas', async (req, res) => {
+  try {
+    const limit = Math.min(Math.max(Number.parseInt(req.query.limite, 10) || 100, 1), 300);
+    const result = await pool.query(`
+      WITH ultima_mensagem AS (
+        SELECT DISTINCT ON (m.instance_name, m.chatid)
+          m.instance_name, m.chatid, m.texto AS ultima_mensagem,
+          m.direcao AS ultima_direcao, m.ocorrido_em AS ultima_atividade
+        FROM crm_mensagens_conversa m
+        WHERE COALESCE(m.chatid, '') <> ''
+        ORDER BY m.instance_name, m.chatid, m.ocorrido_em DESC, m.id DESC
+      ), totais AS (
+        SELECT instance_name, chatid,
+          COUNT(*)::integer AS total_mensagens,
+          COUNT(*) FILTER (WHERE direcao ILIKE '%entr%')::integer AS entradas,
+          COUNT(*) FILTER (WHERE direcao ILIKE '%said%')::integer AS saidas
+        FROM crm_mensagens_conversa
+        WHERE COALESCE(chatid, '') <> ''
+        GROUP BY instance_name, chatid
+      ), clientes AS (
+        SELECT DISTINCT ON (instance_name, chatid)
+          instance_name, chatid, nome_cliente, instagram
+        FROM crm_clientes
+        ORDER BY instance_name, chatid, updated_at DESC NULLS LAST
+      )
+      SELECT u.instance_name, u.chatid,
+        COALESCE(c.nome_cliente, NULLIF(split_part(u.chatid, '@', 1), '')) AS nome_cliente,
+        c.instagram, u.ultima_mensagem, u.ultima_direcao, u.ultima_atividade,
+        t.total_mensagens, t.entradas, t.saidas
+      FROM ultima_mensagem u
+      JOIN totais t USING (instance_name, chatid)
+      LEFT JOIN clientes c USING (instance_name, chatid)
+      ORDER BY u.ultima_atividade DESC NULLS LAST
+      LIMIT $1
+    `, [limit]);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/conversas/:instanceName/:chatid/mensagens', async (req, res) => {
+  try {
+    const limit = Math.min(Math.max(Number.parseInt(req.query.limite, 10) || 120, 1), 500);
+    const result = await pool.query(`
+      SELECT message_id, direcao, autor, message_type, texto, ocorrido_em
+      FROM crm_mensagens_conversa
+      WHERE instance_name = $1 AND chatid = $2
+      ORDER BY ocorrido_em DESC, id DESC
+      LIMIT $3
+    `, [req.params.instanceName, req.params.chatid, limit]);
+    res.json(result.rows.reverse());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/saude', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(503).json({ ok: false, error: 'Banco indisponivel' });
   }
 });
 
