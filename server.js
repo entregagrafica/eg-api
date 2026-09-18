@@ -188,10 +188,10 @@ async function criarPedido(client, cliente, body) {
     cleanText(body.cep),
     normalizeValue('valor_produto', body.valor_produto),
     normalizeValue('valor_frete', body.valor_frete),
-    normalizeValue('sinal_pago', body.sinal_pago || false),
+    false,
     normalizeValue('arte_enviada', body.arte_enviada || false),
     normalizeValue('arte_aprovada', body.arte_aprovada || false),
-    normalizeValue('pagamento_final', body.pagamento_final || false),
+    false,
     normalizeValue('postado', body.postado || false),
     cleanText(body.link_rastreio),
     cleanText(body.pasta_drive),
@@ -608,7 +608,8 @@ app.get('/conversas/:instanceName/:chatid/mensagens', async (req, res) => {
   try {
     const limit = Math.min(Math.max(Number.parseInt(req.query.limite, 10) || 120, 1), 500);
     const result = await pool.query(`
-      SELECT message_id, direcao, autor, message_type, texto, ocorrido_em
+      SELECT message_id, direcao, autor, message_type, texto, ocorrido_em,
+        media_url IS NOT NULL AS tem_midia, media_mime_type, media_file_name
       FROM crm_mensagens_conversa
       WHERE instance_name = $1 AND chatid = $2
       ORDER BY ocorrido_em DESC, id DESC
@@ -618,6 +619,94 @@ app.get('/conversas/:instanceName/:chatid/mensagens', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// The provider URL stays in the database/API only. The browser receives media
+// through this authenticated proxy, so an instance token is never exposed.
+app.get('/conversas/:instanceName/:chatid/mensagens/:messageId/midia', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT media_url, media_mime_type, media_file_name
+      FROM crm_mensagens_conversa
+      WHERE instance_name=$1 AND chatid=$2 AND message_id=$3
+      LIMIT 1
+    `, [req.params.instanceName, req.params.chatid, req.params.messageId]);
+    const media = result.rows[0];
+    if (!media || !media.media_url) return res.status(404).json({ error: 'Midia indisponivel' });
+
+    const source = new URL(media.media_url);
+    const allowedHosts = (process.env.MEDIA_ALLOWED_HOSTS || 'entregagrafica.uazapi.com')
+      .split(',').map((host) => host.trim()).filter(Boolean);
+    if (source.protocol !== 'https:' || !allowedHosts.includes(source.hostname)) {
+      return res.status(400).json({ error: 'Origem de midia nao permitida' });
+    }
+    const upstream = await fetch(source, { redirect: 'error' });
+    if (!upstream.ok) return res.status(502).json({ error: 'Midia nao esta mais disponivel no provedor' });
+    const size = Number(upstream.headers.get('content-length') || 0);
+    if (size > 25 * 1024 * 1024) return res.status(413).json({ error: 'Arquivo maior que o limite de 25 MB' });
+    const bytes = Buffer.from(await upstream.arrayBuffer());
+    if (bytes.length > 25 * 1024 * 1024) return res.status(413).json({ error: 'Arquivo maior que o limite de 25 MB' });
+    const safeName = String(media.media_file_name || 'midia').replace(/[^a-zA-Z0-9._ -]/g, '_');
+    res.set('Content-Type', media.media_mime_type || upstream.headers.get('content-type') || 'application/octet-stream');
+    res.set('Content-Disposition', `inline; filename="${safeName}"`);
+    res.set('Cache-Control', 'private, max-age=300');
+    return res.send(bytes);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/pagamentos/pix/contexto/:pedidoId', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const pedido = await findPedido(client, req.params.pedidoId);
+    if (!pedido) return res.status(404).json({ error: 'Pedido nao encontrado' });
+    if (!pedido.valor_produto) return res.status(400).json({ error: 'Informe o valor do produto antes de confirmar Pix' });
+    const comprovantes = await client.query(`
+      SELECT message_id, message_type, texto, ocorrido_em
+      FROM crm_mensagens_conversa
+      WHERE instance_name=$1 AND chatid=$2
+        AND (message_type ~* '(image|document|audio)' OR texto ~* 'comprovante|pix|pagamento')
+      ORDER BY ocorrido_em DESC, id DESC LIMIT 80
+    `, [pedido.instance_name, pedido.chatid]);
+    const produtoCentavos = Math.round(Number(pedido.valor_produto) * 100);
+    const freteCentavos = Math.round(Number(pedido.valor_frete || 0) * 100);
+    res.json({
+      pedido_id: pedido.id, instance_name: pedido.instance_name, chatid: pedido.chatid,
+      sinal_centavos: Math.round(produtoCentavos / 2),
+      restante_centavos: produtoCentavos - Math.round(produtoCentavos / 2) + freteCentavos,
+      comprovantes: comprovantes.rows
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  } finally { client.release(); }
+});
+
+app.post('/pagamentos/pix/confirmar', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const operatorId = process.env.PIX_OPERATOR_ID;
+    const operatorSecret = process.env.PIX_OPERATOR_SECRET;
+    if (!operatorId || !operatorSecret) return res.status(503).json({ error: 'Confirmacao manual ainda nao configurada no servidor' });
+    const pedido = await findPedido(client, req.body.pedido_id);
+    if (!pedido) return res.status(404).json({ error: 'Pedido nao encontrado' });
+    const tipo = req.body.tipo === 'restante' ? 'restante' : 'sinal';
+    const produtoCentavos = Math.round(Number(pedido.valor_produto || 0) * 100);
+    const freteCentavos = Math.round(Number(pedido.valor_frete || 0) * 100);
+    const valorCentavos = tipo === 'sinal' ? Math.round(produtoCentavos / 2) : produtoCentavos - Math.round(produtoCentavos / 2) + freteCentavos;
+    const result = await client.query(`
+      SELECT * FROM crm_confirmar_pix_manual($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+    `, [operatorId, operatorSecret, pedido.id, pedido.instance_name, pedido.chatid, tipo,
+      valorCentavos, cleanText(req.body.comprovante_message_id), cleanText(req.body.referencia_comprovante),
+      req.body.destino_conferido === true, req.body.status_conferido === true,
+      req.body.valor_conferido === true, req.body.duplicidade_conferida === true,
+      cleanText(req.body.observacao)]);
+    const confirmation = result.rows[0];
+    if (!confirmation || !confirmation.success) return res.status(400).json({ error: confirmation?.message || 'Confirmacao recusada' });
+    return res.json(confirmation);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  } finally { client.release(); }
 });
 
 app.get('/saude', async (req, res) => {
