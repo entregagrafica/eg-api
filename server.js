@@ -376,6 +376,9 @@ app.post('/pedidos/:id/confirmar-sinal-manual', async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Pedido nao encontrado para esta conversa' });
     }
+    // O banco protege campos financeiros. A autorizacao vale somente para esta
+    // transacao, depois da validacao do comprovante pertencente a conversa.
+    await client.query("SELECT set_config('app.payment_authority', 'verified', true)");
     const updated = await client.query(`
       UPDATE crm_pedidos
       SET sinal_pago=true,
