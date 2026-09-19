@@ -382,7 +382,7 @@ app.post('/pedidos/:id/confirmar-sinal-manual', async (req, res) => {
     const updated = await client.query(`
       UPDATE crm_pedidos
       SET sinal_pago=true,
-          data_sinal=COALESCE(data_sinal, (($2::timestamptz AT TIME ZONE 'America/Sao_Paulo')::date)::timestamp, NOW()),
+          data_sinal=COALESCE(data_sinal, (($2::timestamptz AT TIME ZONE 'America/Sao_Paulo')::date + TIME '12:00')::timestamp, NOW()),
           status=CASE WHEN COALESCE(arte_enviada,false) THEN 'aguardando_arte' ELSE 'aguardando_material' END,
           updated_at=NOW()
       WHERE id=$1 RETURNING *
@@ -390,7 +390,7 @@ app.post('/pedidos/:id/confirmar-sinal-manual', async (req, res) => {
     await client.query(`
       UPDATE pedidos_estruturados
       SET sinal_pago=true,
-          data_sinal=COALESCE(data_sinal, (($3::timestamptz AT TIME ZONE 'America/Sao_Paulo')::date)::timestamp, NOW()),
+          data_sinal=COALESCE(data_sinal, (($3::timestamptz AT TIME ZONE 'America/Sao_Paulo')::date + TIME '12:00')::timestamp, NOW()),
           status=CASE WHEN COALESCE(materiais_completos,false) THEN 'aguardando_arte' ELSE 'aguardando_material' END,
           updated_at=NOW()
       WHERE instance_name=$1 AND chatid=$2
