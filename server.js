@@ -113,7 +113,16 @@ async function getDashboardPedido(client, pedidoId) {
   return result.rows[0];
 }
 
-async function findPedido(client, id) {
+async function findPedido(client, id, conversa = {}) {
+  if (conversa.instanceName && conversa.chatid) {
+    const result = await client.query(`
+      SELECT * FROM crm_pedidos
+      WHERE instance_name=$1 AND chatid=$2
+      ORDER BY updated_at DESC NULLS LAST, id DESC
+      LIMIT 1
+    `, [conversa.instanceName, conversa.chatid]);
+    return result.rows[0];
+  }
   const result = await client.query(`
     SELECT *
     FROM crm_pedidos
@@ -122,6 +131,29 @@ async function findPedido(client, id) {
     LIMIT 1
   `, [id]);
   return result.rows[0];
+}
+
+async function criarPedidoManualDaConversa(client, conversa = {}) {
+  if (!conversa.instanceName || !conversa.chatid) return undefined;
+  const cliente = await client.query(`
+    INSERT INTO crm_clientes (instance_name, chatid, nome_cliente, whatsapp_cartao, origem, created_at, updated_at)
+    VALUES ($1, $2, $3, $2, 'dashboard_manual', NOW(), NOW())
+    ON CONFLICT (instance_name, chatid) DO UPDATE SET
+      nome_cliente=COALESCE(NULLIF(EXCLUDED.nome_cliente,''), crm_clientes.nome_cliente), updated_at=NOW()
+    RETURNING *
+  `, [conversa.instanceName, conversa.chatid, conversa.nomeCliente || null]);
+  const pedido = await client.query(`
+    INSERT INTO crm_pedidos (cliente_id, instance_name, chatid, status, origem, created_at, updated_at)
+    VALUES ($1, $2, $3, 'aguardando_material', 'dashboard_manual', NOW(), NOW())
+    RETURNING *
+  `, [cliente.rows[0].id, conversa.instanceName, conversa.chatid]);
+  await client.query(`
+    INSERT INTO pedidos_estruturados (instance_name, chatid, nome_cliente, whatsapp_cartao, sinal_pago, status, created_at, updated_at)
+    VALUES ($1, $2, $3, $2, false, 'aguardando_material', NOW(), NOW())
+    ON CONFLICT (instance_name, chatid) DO UPDATE SET
+      nome_cliente=COALESCE(NULLIF(EXCLUDED.nome_cliente,''), pedidos_estruturados.nome_cliente), updated_at=NOW()
+  `, [conversa.instanceName, conversa.chatid, conversa.nomeCliente || null]);
+  return pedido.rows[0];
 }
 
 async function registrarEvento(client, pedido, tipo, descricao, dados, origem = 'dashboard') {
@@ -311,6 +343,67 @@ app.patch('/pedidos/:id', async (req, res) => {
   } finally {
     client.release();
   }
+});
+
+// Contingencia do chat: grava um sinal real a partir de uma midia recebida.
+// A data vem da mensagem escolhida e nunca do horario do clique no painel.
+app.post('/pedidos/:id/confirmar-sinal-manual', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const conversa = {
+      instanceName: cleanText(req.body?.instance_name),
+      chatid: cleanText(req.body?.chatid),
+      nomeCliente: cleanText(req.body?.nome_cliente)
+    };
+    let pedido = await findPedido(client, req.params.id, conversa);
+    const comprovanteMessageId = cleanText(req.body?.comprovante_message_id);
+    let dataDoComprovante = null;
+    if (comprovanteMessageId) {
+      const comprovante = await client.query(`
+        SELECT ocorrido_em FROM crm_mensagens_conversa
+        WHERE instance_name=$1 AND chatid=$2 AND message_id=$3 AND direcao='entrada'
+        LIMIT 1
+      `, [conversa.instanceName || pedido?.instance_name, conversa.chatid || pedido?.chatid, comprovanteMessageId]);
+      if (!comprovante.rows.length) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'O comprovante selecionado nao pertence a esta conversa' });
+      }
+      dataDoComprovante = comprovante.rows[0].ocorrido_em;
+    }
+    if (!pedido && comprovanteMessageId) pedido = await criarPedidoManualDaConversa(client, conversa);
+    if (!pedido) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Pedido nao encontrado para esta conversa' });
+    }
+    const updated = await client.query(`
+      UPDATE crm_pedidos
+      SET sinal_pago=true,
+          data_sinal=COALESCE(data_sinal, (($2::timestamptz AT TIME ZONE 'America/Sao_Paulo')::date)::timestamp, NOW()),
+          status=CASE WHEN COALESCE(arte_enviada,false) THEN 'aguardando_arte' ELSE 'aguardando_material' END,
+          updated_at=NOW()
+      WHERE id=$1 RETURNING *
+    `, [pedido.id, dataDoComprovante]);
+    await client.query(`
+      UPDATE pedidos_estruturados
+      SET sinal_pago=true,
+          data_sinal=COALESCE(data_sinal, (($3::timestamptz AT TIME ZONE 'America/Sao_Paulo')::date)::timestamp, NOW()),
+          status=CASE WHEN COALESCE(materiais_completos,false) THEN 'aguardando_arte' ELSE 'aguardando_material' END,
+          updated_at=NOW()
+      WHERE instance_name=$1 AND chatid=$2
+    `, [pedido.instance_name, pedido.chatid, dataDoComprovante]);
+    await registrarEvento(client, updated.rows[0], 'sinal_confirmado_manual',
+      'Sinal marcado manualmente pelo painel', {
+        observacao: cleanText(req.body?.observacao),
+        comprovante_message_id: comprovanteMessageId || null,
+        data_do_comprovante: dataDoComprovante ? String(dataDoComprovante).slice(0, 10) : null
+      }, 'dashboard_manual');
+    await client.query('COMMIT');
+    res.json(await getDashboardPedido(client, pedido.id));
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally { client.release(); }
 });
 
 app.delete('/pedidos/:id', async (req, res) => {
