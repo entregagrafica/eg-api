@@ -62,6 +62,7 @@ const pedidoFields = new Set([
   'cep',
   'valor_produto',
   'valor_frete',
+  'data_sinal',
   'arte_enviada',
   'arte_aprovada',
   'postado',
@@ -324,6 +325,11 @@ app.patch('/pedidos/:id', async (req, res) => {
 
     const pedidoUpdates = Object.keys(updates).filter((key) => pedidoFields.has(key));
     if (pedidoUpdates.length) {
+      if (pedidoUpdates.includes('data_sinal')) {
+        // A data é financeira; esta autorização vale apenas para a transação
+        // manual, que também fica registrada no histórico do pedido.
+        await client.query("SELECT set_config('app.payment_authority', 'verified', true)");
+      }
       const values = pedidoUpdates.map((key) => normalizeValue(key, updates[key]));
       values.push(pedido.id);
       const set = pedidoUpdates.map((key, index) => `${key}=$${index + 1}`).join(', ');
@@ -331,6 +337,14 @@ app.patch('/pedidos/:id', async (req, res) => {
         `UPDATE crm_pedidos SET ${set}, updated_at=NOW() WHERE id=$${values.length}`,
         values
       );
+      if (pedidoUpdates.includes('data_sinal')) {
+        const dataSinal = normalizeValue('data_sinal', updates.data_sinal);
+        await client.query(`
+          UPDATE pedidos_estruturados
+          SET data_sinal=$3, updated_at=NOW()
+          WHERE instance_name=$1 AND chatid=$2
+        `, [pedido.instance_name, pedido.chatid, dataSinal]);
+      }
     }
 
     const pedidoAtualizado = (await client.query('SELECT * FROM crm_pedidos WHERE id=$1', [pedido.id])).rows[0];
@@ -400,6 +414,41 @@ app.post('/pedidos/:id/confirmar-sinal-manual', async (req, res) => {
         observacao: cleanText(req.body?.observacao),
         comprovante_message_id: comprovanteMessageId || null,
         data_do_comprovante: dataDoComprovante ? String(dataDoComprovante).slice(0, 10) : null
+      }, 'dashboard_manual');
+    await client.query('COMMIT');
+    res.json(await getDashboardPedido(client, pedido.id));
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally { client.release(); }
+});
+
+// Reverte uma confirmação feita por engano no painel e deixa registro auditável.
+// O status do pedido não é alterado, pois ele pode já ter avançado por outras etapas.
+app.post('/pedidos/:id/desmarcar-sinal-manual', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const pedido = await findPedido(client, req.params.id);
+    if (!pedido) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Nao encontrado' });
+    }
+    await client.query("SELECT set_config('app.payment_authority', 'verified', true)");
+    const updated = await client.query(`
+      UPDATE crm_pedidos
+      SET sinal_pago=false, data_sinal=NULL, updated_at=NOW()
+      WHERE id=$1 RETURNING *
+    `, [pedido.id]);
+    await client.query(`
+      UPDATE pedidos_estruturados
+      SET sinal_pago=false, data_sinal=NULL, updated_at=NOW()
+      WHERE instance_name=$1 AND chatid=$2
+    `, [pedido.instance_name, pedido.chatid]);
+    await registrarEvento(client, updated.rows[0], 'sinal_desmarcado_manual',
+      'Sinal desmarcado manualmente pelo painel', {
+        observacao: cleanText(req.body?.observacao),
+        data_sinal_anterior: pedido.data_sinal || null
       }, 'dashboard_manual');
     await client.query('COMMIT');
     res.json(await getDashboardPedido(client, pedido.id));
